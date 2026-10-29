@@ -1,0 +1,201 @@
+name: CI/CD Pipeline with CloudChange Risk Analysis
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TRIVY_SEVERITY: CRITICAL,HIGH
+
+jobs:
+  # ---------------------------------------------------------------- tests
+  backend-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install dependencies
+        working-directory: ./backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run backend tests
+        working-directory: ./backend
+        run: python -m pytest tests/ -v
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+      - name: Build
+        working-directory: ./frontend
+        run: npm run build
+
+  # ---------------------------------------------------------------- trivy: source + IaC
+  trivy-repo-scan:
+    name: Trivy (filesystem, secrets, IaC)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Dependencies (requirements.txt, package-lock.json) + hardcoded secrets + misconfigurations
+      - name: Trivy scan (SARIF report)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: true
+          skip-dirs: "**/node_modules,**/venv"
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: "0"
+
+      - name: Upload SARIF to GitHub code scanning
+        if: always() && hashFiles('trivy-fs.sarif') != ''
+        continue-on-error: true   # needs code scanning enabled (public repo or GitHub Advanced Security)
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Trivy gate (fail on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: true
+          skip-dirs: "**/node_modules,**/venv"
+          format: table
+          exit-code: "1"
+
+      - name: Trivy IaC scan (Kubernetes manifests, Helm chart, Dockerfiles)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: ${{ env.TRIVY_SEVERITY }}
+          skip-dirs: "**/node_modules,**/venv"
+          format: table
+          exit-code: "0"   # report only; set to "1" once existing findings are fixed
+
+  # ---------------------------------------------------------------- docker build + trivy image scan
+  docker-build-scan:
+    name: Docker build + Trivy (${{ matrix.service }})
+    needs: [backend-test, frontend-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t cloudchange-${{ matrix.service }}:${{ github.sha }} ./${{ matrix.service }}
+
+      - name: Trivy image scan (SARIF report)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: cloudchange-${{ matrix.service }}:${{ github.sha }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: "0"
+
+      - name: Upload SARIF to GitHub code scanning
+        if: always() && hashFiles(format('trivy-{0}.sarif', matrix.service)) != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+      - name: Trivy image gate (fail on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: cloudchange-${{ matrix.service }}:${{ github.sha }}
+          format: table
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: "1"
+
+  # ---------------------------------------------------------------- helm
+  helm-validation:
+    needs: [backend-test, frontend-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.12.0
+      - name: Helm lint
+        run: helm lint ./helm/cloudchange-demo
+      - name: Helm template
+        run: helm template ./helm/cloudchange-demo
+
+  # ---------------------------------------------------------------- cloudchange risk analysis
+  cloudchange-analysis:
+    needs: [trivy-repo-scan, docker-build-scan, helm-validation]
+    runs-on: ubuntu-latest
+    outputs:
+      requires_approval: ${{ steps.analyze.outputs.requires_approval }}
+      strategy: ${{ steps.analyze.outputs.strategy }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Run CloudChange analysis
+        id: analyze
+        run: |
+          pip install -r backend/requirements.txt
+          bash scripts/run_cloudchange_analysis.sh "$GITHUB_OUTPUT" payment-service
+
+  deployment-decision:
+    needs: cloudchange-analysis
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.cloudchange-analysis.outputs.requires_approval == 'True' && 'production-approval' || 'development' }}
+    steps:
+      - name: Proceed with deployment
+        run: |
+          echo "Deployment Strategy: ${{ needs.cloudchange-analysis.outputs.strategy }}"
+          echo "Requires Approval: ${{ needs.cloudchange-analysis.outputs.requires_approval }}"
+          echo "Deployment logic simulated."
